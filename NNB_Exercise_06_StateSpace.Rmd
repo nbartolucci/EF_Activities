@@ -1,0 +1,497 @@
+Activity 6 - State-space models
+========================================================
+
+This activity will explore the state-space framework for modeling time-series and spatial data sets. Chapter 8 provides a more in-depth description of the state-space model, but in a nutshell it is based on separating the process model, which describes how the system evolves in time or space, from the observation error model. Furthermore, the state-space model gets its name because the model estimates that true value of the underlying **latent** state variables.
+
+For this activity we will write all the code, process all the data, and visualize all the outputs in R, but the core of the Bayesian computation will be handled by JAGS (Just Another Gibbs Sampler, http://mcmc-jags.sourceforge.net). Therefore, before we get started you will want to download both the JAGS software and the rjags library, which allows R to call JAGS. We're also going to install our `ecoforecastR` package, which has some helper functions we will use.
+
+```{r}
+library(rjags)
+#library(rnoaa)
+library(daymetr)
+source("/Users/niabartolucci/Dropbox/My Mac (Nia’s MacBook Pro)/Desktop/Classes Spring 2021/Ecological Forecasting/EF_Activities/ecoforecastR/R/utils.R")
+source("/Users/niabartolucci/Dropbox/My Mac (Nia’s MacBook Pro)/Desktop/Classes Spring 2021/Ecological Forecasting/EF_Activities/ecoforecastR/R/ParseFixed.R")
+source("/Users/niabartolucci/Dropbox/My Mac (Nia’s MacBook Pro)/Desktop/Classes Spring 2021/Ecological Forecasting/EF_Activities/ecoforecastR/R/fit_dlm.R")
+source("/Users/niabartolucci/Dropbox/My Mac (Nia’s MacBook Pro)/Desktop/Classes Spring 2021/Ecological Forecasting/EF_Activities/ecoforecastR/R/predict_dlm.R")
+
+
+#remotes::install_github("EcoForecast/ecoforecastR",force=TRUE)
+```
+
+Next we'll want to grab the data we want to analyze. For this example we'll use the Google Flu Trends data for the state of Massachusetts, which we saw how to pull directly off the web in Activity 3.
+
+```{r}
+gflu = read.csv("data/gflu_data.txt",skip=11)
+time = as.Date(gflu$Date)
+y = gflu$Massachusetts
+plot(time,y,type='l',ylab="Flu Index",lwd=2,log='y')
+```
+
+Next we'll want to define the JAGS code, which we'll do by writing the code as a string in R. The code itself has three components, the data model, the process model, and the priors. The data model relates the observed data, y, at any time point to the latent variable, x. For this example we'll assume that the observation model just consists of Gaussian observation error. The process model relates the state of the system at one point in time to the state one time step ahead. In this case we'll start with the simplest possible process model, a random walk, which just consists of Gaussian process error centered around the current value of the system.
+
+$$X_{t+1} \sim N(X_{t},\tau_{add})$$
+
+Finally, for the priors we need to define priors for the initial condition, the process error, and the observation error.
+
+```{r}
+RandomWalk = "
+model{
+  
+  #### Data Model
+  for(t in 1:n){
+    y[t] ~ dnorm(x[t],tau_obs)
+  }
+  
+  #### Process Model
+  for(t in 2:n){
+    x[t]~dnorm(x[t-1],tau_add)
+  }
+  
+  #### Priors
+  x[1] ~ dnorm(x_ic,tau_ic)
+  tau_obs ~ dgamma(a_obs,r_obs)
+  tau_add ~ dgamma(a_add,r_add)
+}
+"
+```
+
+Next we need to define the data and priors as a list. For this analysis we'll work with the log of the Google flu index since the zero-bound on the index and the magnitudes of the changes appear much closer to a log-normal distribution than to a normal.
+```{r}
+data <- list(y=log(y),n=length(y),x_ic=log(1000),tau_ic=100,a_obs=1,r_obs=1,a_add=1,r_add=1)
+```
+
+Next we need to definite the initial state of the model's parameters for each chain in the MCMC. The overall initialization is stored as a list the same length as the number of chains, where each chain is passed a list of the initial values for each parameter. Unlike the definition of the priors, which had to be done independent of the data, the initialization of the MCMC is allowed (and even encouraged) to use the data. However, each chain should be started from different initial conditions. We handle this below by basing the initial conditions for each chain off of a different random sample of the original data. 
+```{r}
+nchain = 3
+init <- list()
+for(i in 1:nchain){
+  y.samp = sample(y,length(y),replace=TRUE)
+  init[[i]] <- list(tau_add=1/var(diff(log(y.samp))),tau_obs=5/var(log(y.samp)))
+}
+```
+
+Now that we've defined the model, the data, and the initialization, we need to send all this info to JAGS, which will return the JAGS model object.
+```{r}
+j.model   <- jags.model (file = textConnection(RandomWalk),
+                             data = data,
+                             inits = init,
+                             n.chains = 3)
+```
+
+Next, given the defined JAGS model, we'll want to take a few samples from the MCMC chain and assess when the model has converged. To take samples from the MCMC object we'll need to tell JAGS what variables to track and how many samples to take.
+```{r, fig.asp = 1.0}
+## burn-in
+jags.out   <- coda.samples (model = j.model,
+                            variable.names = c("tau_add","tau_obs"),
+                                n.iter = 1000)
+plot(jags.out)
+```
+
+Here we see that the model converges rapidly. Since rjags returns the samples as a CODA object, we can use any of the diagnositics in the R *coda* library to test for convergence, summarize the output, or visualize the chains.
+
+Now that the model has converged we'll want to take a much larger sample from the MCMC and include the full vector of X's in the output
+```{r}
+jags.out   <- coda.samples (model = j.model,
+                            variable.names = c("x","tau_add","tau_obs"),
+                                n.iter = 10000)
+```
+
+Given the full joint posteror samples, we're next going to visualize the output by just looking at the 95% credible interval of the timeseries of X's and compare that to the observed Y's. To do so we'll convert the coda output into a matrix and then calculate the quantiles. Looking at colnames(out) will show you that the first two columns are `tau_add` and `tau_obs`, so we calculate the CI starting from the 3rd column. We also transform the samples back from the log domain to the linear domain.
+```{r}
+time.rng = c(1,length(time)) ## adjust to zoom in and out
+out <- as.matrix(jags.out)
+x.cols <- grep("^x",colnames(out)) ## grab all columns that start with the letter x
+ci <- apply(exp(out[,x.cols]),2,quantile,c(0.025,0.5,0.975)) ## model was fit on log scale
+
+plot(time,ci[2,],type='n',ylim=range(y,na.rm=TRUE),ylab="Flu Index",log='y',xlim=time[time.rng])
+## adjust x-axis label to be monthly if zoomed
+if(diff(time.rng) < 100){ 
+  axis.Date(1, at=seq(time[time.rng[1]],time[time.rng[2]],by='month'), format = "%Y-%m")
+}
+ciEnvelope(time,ci[1,],ci[3,],col=col.alpha("lightBlue",0.75))
+points(time,y,pch="+",cex=0.5)
+```
+
+Next, lets look at the posterior distributions for `tau_add` and `tau_obs`, which we'll convert from precisions back into standard deviations. 
+```{r}
+hist(1/sqrt(out[,1]),main=colnames(out)[1])
+hist(1/sqrt(out[,2]),main=colnames(out)[2])
+```
+We'll also want to look at the joint distribution of the two parameters to check whether the two parameters strongly covary.
+```{r, fig.asp = 1.0}
+plot(out[,1],out[,2],pch=".",xlab=colnames(out)[1],ylab=colnames(out)[2])
+cor(out[,1:2])
+```
+
+
+Assignment:
+-----------
+
+To explore the ability of state space models to generate forecasts (or in this case, a hindcast) remove the last 40 observations (convert to NA) and refit the model.
+
+* Generate a time-series plot for the CI of x that includes the observations (as above but zoom the plot on the last ~80 observations). Use a different color and symbol to differentiate observations that were included in the model versus those that were converted to NA's.
+```{r}
+library(rjags)
+#library(rnoaa)
+library(daymetr)
+source("/Users/niabartolucci/Dropbox/My Mac (Nia’s MacBook Pro)/Desktop/Classes Spring 2021/Ecological Forecasting/EF_Activities/ecoforecastR/R/utils.R")
+source("/Users/niabartolucci/Dropbox/My Mac (Nia’s MacBook Pro)/Desktop/Classes Spring 2021/Ecological Forecasting/EF_Activities/ecoforecastR/R/ParseFixed.R")
+source("/Users/niabartolucci/Dropbox/My Mac (Nia’s MacBook Pro)/Desktop/Classes Spring 2021/Ecological Forecasting/EF_Activities/ecoforecastR/R/fit_dlm.R")
+source("/Users/niabartolucci/Dropbox/My Mac (Nia’s MacBook Pro)/Desktop/Classes Spring 2021/Ecological Forecasting/EF_Activities/ecoforecastR/R/predict_dlm.R")
+
+
+##New Data with NA as last 40 rows
+
+gflu_NA<-gflu
+gflu_NA[c(580:620),2:50]<-NA
+time_NA = as.Date(gflu_NA$Date)
+y_NA = gflu_NA$Massachusetts
+NA_points<-y[c(580:620)]
+NA_time<-time_NA[c(580:620)]
+plot(time_NA,y_NA,type='l',ylab="Flu Index",lwd=2,log='y')
+
+#Random Walk
+RandomWalk_NA = "
+model{
+  
+  #### Data Model
+  for(t in 1:n){
+    y[t] ~ dnorm(x[t],tau_obs)
+  }
+  
+  #### Process Model
+  for(t in 2:n){
+    x[t]~dnorm(x[t-1],tau_add)
+  }
+  
+  #### Priors
+  x[1] ~ dnorm(x_ic,tau_ic)
+  tau_obs ~ dgamma(a_obs,r_obs)
+  tau_add ~ dgamma(a_add,r_add)
+}
+"
+
+
+#Data as a list
+data_NA <- list(y=log(y_NA),n=length(y_NA),x_ic=log(1000),tau_ic=100,a_obs=1,r_obs=1,a_add=1,r_add=1)
+
+#Initial Conditions
+
+nchain = 3
+init_NA <- list()
+for(i in 1:nchain){
+  y.samp_NA = sample(y_NA,length(y_NA),replace=TRUE)
+  init_NA[[i]] <- list(tau_add=1/var(diff(log(y.samp_NA))),tau_obs=5/var(log(y.samp_NA)))
+}
+
+
+#Now that we've defined the model, the data, and the initialization, we need to send all this info to JAGS, which will return the JAGS model object.
+
+j.model_NA   <- jags.model (file = textConnection(RandomWalk_NA),
+                             data = data_NA,
+                             inits = init_NA,
+                             n.chains = 3)
+
+#figure out burn in 
+jags.out_NA   <- coda.samples (model = j.model_NA,
+                            variable.names = c("tau_add","tau_obs"),
+                            n.iter = 1000)
+plot(jags.out_NA)
+
+# increase iterations
+jags.out_NA   <- coda.samples (model = j.model_NA,
+                            variable.names = c("x","tau_add","tau_obs"),
+                            n.iter = 10000)
+
+#CI
+time.rng = c(540,length(time_NA)) ## adjust to zoom in and out
+out_NA <- as.matrix(jags.out_NA)
+x.cols_NA <- grep("^x",colnames(out_NA)) ## grab all columns that start with the letter x
+ci_NA <- apply(exp(out_NA[,x.cols_NA]),2,quantile,c(0.025,0.5,0.975)) ## model was fit on log scale
+
+plot(time_NA,ci_NA[2,],type='n',ylim=range(y),ylab="Flu Index",log='y',xlim=time[time.rng])
+## adjust x-axis label to be monthly if zoomed
+if(diff(time.rng) < 100){ 
+  axis.Date(1, at=seq(time[time.rng[1]],time[time.rng[2]],by='month'), format = "%Y-%m")
+}
+ciEnvelope(time,ci_NA[1,],ci_NA[3,],col=col.alpha("lightBlue",0.75))
+points(time_NA,y_NA,pch="+",cex=0.5)
+points(NA_time,NA_points, pch=5, cex=0.5, col="red")
+#the blue is the 95% confidence interval, the black points are the observed data and the red points are the predicted. 
+
+```
+* Comment on how well the random walk model performed (both accuracy and precision) and how it might be modified to improve both these criteria.
+````{r}
+# The random walk model is accurate as it contains most points but it's not very precise (esp in the predicted range).  The closer to known data the more precise the model is. The model estimates missing values based on the process model but it won't be as precise if there is a lot of missing data. Uncertainty compounds as you move away from the last observed data point. Both accuracy and precision could be improved by including better prior information.
+```
+
+Extra Credit (Part 1):
+----------------------
+To look at how observation frequency affects data assimilation, convert 3 out of every 4 observations to NA (i.e. treat the data as approximately monthly) and refit the model. 
+
+* Generate a time-series plot for the CI of x that includes the observations (as above). Use a different color and symbol to differentiate observations that were included in the model versus those that were converted to NA's.
+```{r}
+
+MassFlu = data.frame(Date = gflu$Date, Massachusetts = gflu$Massachusetts)
+MassFlu_EC = data.frame(Date = gflu$Date, Massachusetts = gflu$Massachusetts)
+MassFlu_Points<- MassFlu[-seq(4, NROW(MassFlu), by = 4),] # NA points 
+
+time_EC = as.Date(MassFlu_Points$Date)
+
+TotalTime = length(MassFlu_EC$Massachusetts)
+
+for(i in 1:TotalTime){
+  if(i%%4){
+MassFlu_EC[i,2]=NA
+  }
+}
+
+y_EC<-MassFlu_EC$Massachusetts
+
+
+
+RandomWalk_EC = "
+model{
+  
+  #### Data Model
+  for(t in 1:n){
+    y[t] ~ dnorm(x[t],tau_obs)
+  }
+  
+  #### Process Model
+  for(t in 2:n){
+    x[t]~dnorm(x[t-1],tau_add)
+  }
+  
+  #### Priors
+  x[1] ~ dnorm(x_ic,tau_ic)
+  tau_obs ~ dgamma(a_obs,r_obs)
+  tau_add ~ dgamma(a_add,r_add)
+}
+"
+
+#Next we need to define the data and priors as a list. For this analysis we'll work with the log of the Google flu index since the zero-bound on the index and the magnitudes of the changes appear much closer to a log-normal distribution than to a normal.
+
+data_EC <- list(y=log(y_EC),n=length(y_EC),x_ic=log(1000),tau_ic=100,a_obs=1,r_obs=1,a_add=1,r_add=1)
+
+#Initial Conditions
+
+nchain = 3
+init_EC <- list()
+for(i in 1:nchain){
+  y.samp_EC = sample(y_EC,length(y_EC),replace=TRUE)
+  init_EC[[i]] <- list(tau_add=1/var(diff(log(y.samp_EC))),tau_obs=5/var(log(y.samp_EC)))
+}
+
+
+#Now that we've defined the model, the data, and the initialization, we need to send all this info to JAGS, which will return the JAGS model object.
+
+j.model_EC   <- jags.model (file = textConnection(RandomWalk_EC),
+                            data = data_EC,
+                            inits = init_EC,
+                            n.chains = 3)
+
+#figure out burn in 
+jags.out_EC   <- coda.samples (model = j.model_EC,
+                               variable.names = c("tau_add","tau_obs"),
+                               n.iter = 1000)
+plot(jags.out_EC)
+
+# increase iterations
+jags.out_EC   <- coda.samples (model = j.model_EC,
+                               variable.names = c("x","tau_add","tau_obs"),
+                               n.iter = 10000)
+
+#CI
+time.rng = c(540,length(time_NA)) ## adjust to zoom in and out
+out_EC <- as.matrix(jags.out_EC)
+x.cols_EC <- grep("^x",colnames(out_EC)) ## grab all columns that start with the letter x
+ci_EC <- apply(exp(out_EC[,x.cols_EC]),2,quantile,c(0.025,0.5,0.975)) ## model was fit on log scale
+
+plot(time_NA,ci_EC[2,],type='n',ylim=range(y),ylab="Flu Index",log='y',xlim=time[time.rng])
+## adjust x-axis label to be monthly if zoomed
+if(diff(time.rng) < 100){ 
+  axis.Date(1, at=seq(time[time.rng[1]],time[time.rng[2]],by='month'), format = "%Y-%m")
+}
+ciEnvelope(time,ci_EC[1,],ci_EC[3,],col=col.alpha("lightBlue",0.75))
+points(time,y_EC,pch="+",cex=0.5) #Observed points
+points(time_EC,MassFlu_Points$Massachusetts, pch=5, cex=0.5, col="red") #Modeled points
+
+# The blue is the 95% confidence interval, the black points are the observed data and the the red points are the predicted. 
+
+```
+* Compare the CI between the two runs.
+```{r}
+#Comparing the CIs of the random walk with the last 40 observations removed and the random walk with three out of every four observations removed, it appears that the CI is much more constrained when there are more observed data points. For example, the CI on the model with just the last 40 obs. removed is quite constrained until the predicted points. For the model with more points removed, the CI is more constrained around the observed data points and broader at the predicted points. 
+```
+* Generate a predicted (median) vs observed plot for the data points that were removed
+```{r}
+Median_EC<- data.frame(ci_EC[2,])
+Median_Predicted<- Median_EC[-seq(4, NROW(Median_EC$ci_EC.2...), by = 4),] # NA points 
+
+plot(MassFlu_Points$Massachusetts,Median_Predicted, xlab="Observed", ylab="Predicted")
+
+
+```
+* Comment on the accuracy and precision of the state estimates.
+```{r}
+# Looking at the observed vs predicted, it appears that the model is more accurate at low case number but becomes less accurate when case numbers increase. It also appears the precision decreases as the number of cases increases. 
+```
+* How does the reduction in data volume affect the parameter estimates (taus)
+```{r}
+#The reduction in data volume decreases the taus indicating a decrease in precision and increase in variance. 
+```
+
+# Dynamic Linear Models
+
+The random walk model can easily be generalized to more sophisiticated models describing the dynamics of the system. One simple but useful extension is the class of dynamic linear models (DLMs) -- linear models where the future state depends on the current state and other covariates, $z_t$
+
+$$X_{t+1} \sim N(X_t + \beta_0 + \beta_1 z_t + \beta_{X} X_{t}, \tau_{add})$$
+
+where $\beta_0$ is the intercept, $\beta_1$ is the slope of the covariate effect, and $\beta_{X}$ is the slope of the initial condition effect, expressed as a deviation from the random walk default (i.e. the actual slope is $1 + \beta_X$). Rather than implement this model in JAGS directly, we're going to rely on the ecoforecastR package, which accepts a `lm` like syntax for specifying covariates (with the notable exception that the response variable, which is our latent X, is not specified explictly). Here we're going to use the Daymet product to get daily weather estimates, and then use daily minimum temperature (Tmin) as the covariate in our influenza model
+
+```{r}
+## grab weather data
+df <- daymetr::download_daymet(site = "Boston",
+                lat = 42.36,
+                lon = -71.06,
+                start = 2003,
+                end = 2016,
+                internal = TRUE)$data
+df$date <- as.Date(paste(df$year,df$yday,sep = "-"),"%Y-%j")
+data$Tmin = df$tmin..deg.c.[match(time,df$date)]
+
+## fit the model
+ef.out <- fit_dlm(model=list(obs="y",fixed="~ 1 + X + Tmin"),data)
+names(ef.out)
+```
+
+The package returns a list with four elements. `params` and `predict` are both the same mcmc.list objects we get back from JAGS, only split between the parameters and the latent state variables, respectively, to make it easier to perform diagnostics and visualizations:
+
+```{r, fig.asp = 1.0}
+## parameter diagnostics
+params <- window(ef.out$params,start=1000) ## remove burn-in
+plot(params)
+summary(params)
+cor(as.matrix(params))
+pairs(as.matrix(params))
+
+## confidence interval
+out_DLM <- as.matrix(ef.out$predict)
+ci_DLM <- apply(exp(out_DLM),2,quantile,c(0.025,0.5,0.975))
+plot(time,ci_DLM[2,],type='n',ylim=range(y,na.rm=TRUE),ylab="Flu Index",log='y',xlim=time[time.rng])
+## adjust x-axis label to be monthly if zoomed
+if(diff(time.rng) < 100){ 
+  axis.Date(1, at=seq(time[time.rng[1]],time[time.rng[2]],by='month'), format = "%Y-%m")
+}
+ciEnvelope(time,ci_DLM[1,],ci_DLM[3,],col=col.alpha("lightBlue",0.75))
+points(time,y,pch="+",cex=0.5)
+```
+
+
+The JAGS model that was fit 'under the hood' is returned as `model` which we can view as:
+```{r, echo=FALSE}
+strsplit(ef.out$model,"\n",fixed = TRUE)[[1]]
+```
+This code illustrates a few things:
+* The "Priors" section is identical to our earlier random walk model
+* The "Random Effects" section, which is currently commented out, illustrates that the `ecoforcastR::fit_dlm` function supports random effects, which can be turned on via the `model$random` argument
+* The "Fixed Effects" section contains additional priors for our fixed effects as well as priors on the means (mu) and precisions (tau) of the covariates. 
+* The "Data Model" section is the same as in our random walk except for the addition of code for the means of the covariates. This code is here as a very simple missing data model -- any time the covariate is observed it is used to estimate the mean and precision, but any time the covariate is missing (NA) it is imputed.
+* The "Process Model" is very similar to the random walk, except now the expected value (mu) is calculated according to the linear model described earlier
+
+Finally, the returned object also includes the `data` that was used to fit the model.
+
+Part 2:
+-----------
+
+* Compare the process and observation error estimates and model CI between this fit and the original random walk model. How much has the residual variance been reduced by?
+```{r}
+#DLM summary
+summary(params)
+
+#Random Walk summary
+summary(jags.out)
+
+# the process errors are similar for both models, but the observation error is much greater for the DLM than the random walk. As the mean tau obs is the precision or 1/variance, this makes sense. This greater value indicates a higher precision and lower variance. The random walk variance was bigger (1/precision). Residual variance decreased by .0167. DLM variance = 0.043 random walk variance = 0.059. I calculated these values by adding 1/mean tau obs and 1/mean tau add.
+
+
+# Comparison of confidence intervals -- it appears that the confidence interval is more constrained on the DLM model than the random walk model. See above for CI graphs.
+
+```
+* Because a state-space model returns X's that are close to the Y's, metrics such as R2 and RMSE aren't great metrics of model performance. Besides looking at the taus, how else could we judge which model is doing better (in a way that avoids/penalizes overfitting)?
+
+```{r}
+#One way to judge which model is doing better to plot observed data vs predicted data for those same data points. This can tell you about the predictive error.
+
+
+#it seems that for the DLM model you could do an analysis of the model to see how much explanatory power the parameters have (calculate a p value for each parameter).predcited vs observed,  usually look at rsiduals check for heteroscedaticity . but rresiduals  are just on observed data tell you where model is doing good an dpoorly you used observed to estiamte predicted but can plot predictions into the future as to look at predictive error ' more parameters you put in parameter error increases residual error declines -- want to minimize parameter error 
+```
+* Explain and discuss the parameter estimates (betas) from the linear model (what do they mean both biologically and in terms of the predictability of the system) and their correlations
+```{r}
+cor(as.matrix(params)) #highly correlated because ratio of the two  parameters gives you the mean 
+pairs(as.matrix(params))
+#means are actually precisions 
+#The betaIntercept is the intercept, the betaTmin is the slope of the covariate effect of daily minimum temperature on influenza, and betaX is the slope of the initial conditions effect.The intercept causes the model to have an equilibrium that isn't equal to zero. Both betaTmin and betax are negative indicating that as temperature increases flu goes down. The betaTmin and betax are negatively correlated with betaIntercept and positively correlated with each other.
+```
+
+Part 3:
+-----------
+
+Repeat the process of forecasting the last 40 observations (convert to NA), this time using the DLM with temperature as a covariate
+
+* Generate a time-series plot for the CI that includes the observations and both the random walk and DLM models (Hint, think about the order you plot in so you can see both models, also consider including transpancy [alpha] in the CI color)
+```{r}
+
+## grab weather data
+df <- daymetr::download_daymet(site = "Boston",
+                               lat = 42.36,
+                               lon = -71.06,
+                               start = 2003,
+                               end = 2016,
+                               internal = TRUE)$data
+df$date <- as.Date(paste(df$year,df$yday,sep = "-"),"%Y-%j")
+data_NA$Tmin = df$tmin..deg.c.[match(time,df$date)]
+
+ef.out_NA <- fit_dlm(model=list(obs="y",fixed="~ 1 + X + Tmin"),data_NA)
+names(ef.out)
+
+
+
+## parameter diagnostics
+params_NA <- window(ef.out_NA$params,start=1000) ## remove burn-in
+plot(params_NA)
+summary(params_NA)
+cor(as.matrix(params_NA))
+pairs(as.matrix(params_NA))
+
+## confidence interval
+out_DLM_NA <- as.matrix(ef.out_NA$predict)
+ci_DLM_NA <- apply(exp(out_DLM_NA),2,quantile,c(0.025,0.5,0.975))
+plot(time,ci_DLM_NA[2,],type='n',ylim=range(y,na.rm=TRUE),ylab="Flu Index",log='y',xlim=time[time.rng])
+## adjust x-axis label to be monthly if zoomed
+if(diff(time.rng) < 100){ 
+  axis.Date(1, at=seq(time[time.rng[1]],time[time.rng[2]],by='month'), format = "%Y-%m")
+}
+
+ciEnvelope(time,ci_NA[1,],ci_NA[3,],col=col.alpha("lightBlue",0.75)) #This is random walk with NA excluded
+ciEnvelope(time,ci_DLM_NA[1,],ci_DLM_NA[3,],col=col.alpha("grey",0.75)) #this is DLM with NA excluded
+
+points(time,y_NA,pch="+",cex=0.5)
+points(NA_time,NA_points, pch=5, cex=0.5, col="blue") #predicted points
+
+#grey is the DLM model and blue is the random walk model. The black points are the observed points, and the blue points are the predicted. 
+```
+
+* Comment on how well the DLM model performed (both accuracy and precision) relative to the random walk and the true observations. How could the model be further improved?
+```{r}
+# Overall the DLM model was more precise and accurate. Although there are a few points  (around the beginning of 2015) that look like they are outside of the CI for the DLM indicating lower accuracy for those points. Overall though the CI is more tightly constrained around the data points (both observed and predicted) indicating higher precision. The model could be improved by better prior information as well as looking for other important covariates. Also, the model could be improved if we included  known observations in the predicted range. 
+```
+# Next steps 
+
+Apply these modeling approaches to you own time-series data! As a simple place to start note that you can fit the basic Random Walk model using `fit_dlm` just by setting `fixed = ""`. Also, as with standard `lm` syntax, you can suppress the intercept by including -1 in fixed, specify interaction terms using multiplication (e.g. X * Tmin), and express polynomials both on X and on covariates (e.g. X^2 or Tmin^2). The latter allows you to construct models with stabalizing feedbacks, for example:
+
+$$ N_{t+1} = N_t + rN_t \left( 1 + {{N_t}\over{K}} \right) = (1+r)N_t + {{r}\over{K}}N_t^2$$
+can be expressed as fixed = "-1 + X + X^2" where $\beta_X = r$ and $\beta_{X^2} = r/K$.
+
+Within the ecoforecastR package, the ParseFixed function (which is used by fit_dlm) can also construct text strings for process models, priors, and missing data models that can be inserted into other JAGS models, which allows you to easily construct non-Gaussian dynamic generalized linear mixed models (DGLMMs), data fusion models, or more complex nonlinear models.
